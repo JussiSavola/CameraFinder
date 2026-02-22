@@ -221,33 +221,99 @@ def probe_rtsp(ip, port, timeout, path="/"):
     return None
 
 
-def probe_rtsp_with_creds(ip, port, timeout, path, user, password):
-    """Try RTSP DESCRIBE with credentials (Basic auth in URL)."""
-    if user or password:
-        userinfo = f"{user}:{password}@" if password else f"{user}@"
-    else:
-        userinfo = ""
-    url = f"rtsp://{userinfo}{ip}:{port}{path}"
-    probe = (
+def _rtsp_describe(sock, url, cseq, extra_headers=""):
+    """Send a single RTSP DESCRIBE request and return the raw response."""
+    req = (
         f"DESCRIBE {url} RTSP/1.0\r\n"
-        f"CSeq: 2\r\n"
+        f"CSeq: {cseq}\r\n"
         f"User-Agent: CameraScanner/2.0\r\n"
         f"Accept: application/sdp\r\n"
+        f"{extra_headers}"
         f"\r\n"
     ).encode()
+    sock.sendall(req)
+    return sock.recv(4096).decode(errors="replace")
+
+
+def _parse_digest_challenge(response):
+    """Extract Digest auth parameters from a 401 WWW-Authenticate header."""
+    m = re.search(r'WWW-Authenticate:\s*Digest\s+(.+)', response, re.I)
+    if not m:
+        return None
+    params = {}
+    for key, val in re.findall(r'(\w+)="([^"]*)"|', m.group(1)):
+        if key:
+            params[key] = val
+    return params
+
+
+def _make_digest_header(user, password, method, uri, params):
+    """Build an Authorization: Digest header for the given challenge."""
+    import hashlib
+    realm  = params.get("realm", "")
+    nonce  = params.get("nonce", "")
+    ha1 = hashlib.md5(f"{user}:{realm}:{password}".encode()).hexdigest()
+    ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
+    response_hash = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+    return (
+        f'Authorization: Digest username="{user}", realm="{realm}", '
+        f'nonce="{nonce}", uri="{uri}", response="{response_hash}"\r\n'
+    )
+
+
+def probe_rtsp_with_creds(ip, port, timeout, path, user, password):
+    """
+    Try RTSP DESCRIBE with credentials, supporting both Basic and Digest auth.
+
+    Protocol:
+      1. Send DESCRIBE with no auth header.
+      2. If 200  → stream is open, return "200 OK".
+      3. If 401 with Digest challenge → compute Digest response and retry.
+      4. If 401 with Basic challenge  → retry with Authorization: Basic header.
+      5. If still 401 after retry     → wrong credentials, return "401 Auth required".
+      6. If 404 / no response         → return None (path absent or unreachable).
+    """
+    url = f"rtsp://{ip}:{port}{path}"
     try:
         with socket.create_connection((ip, port), timeout=timeout) as s:
-            s.sendall(probe)
-            data = s.recv(1024).decode(errors="replace")
-            # 200 OK means stream accessible; 401 means auth needed but it IS a stream
-            if "RTSP/1.0 200" in data or "RTSP/1.1 200" in data:
+            # ── Step 1: unauthenticated probe ────────────────────────
+            resp1 = _rtsp_describe(s, url, cseq=1)
+
+            if "RTSP/1.0 200" in resp1 or "RTSP/1.1 200" in resp1:
                 return "200 OK - stream accessible"
-            if "RTSP/1.0 401" in data or "RTSP/1.1 401" in data:
+
+            if "RTSP/1.0 404" in resp1 or "RTSP/1.1 404" in resp1:
+                return None  # path does not exist
+
+            if "RTSP/1.0 401" not in resp1 and "RTSP/1.1 401" not in resp1:
+                return None  # unexpected response, treat as absent
+
+            # Path exists and requires auth — but if no credentials given, report 401
+            if not user and not password:
                 return "401 Auth required"
-            if "RTSP/1.0 403" in data:
+
+            # ── Step 2: try Digest auth first (most common on cameras) ──
+            digest_params = _parse_digest_challenge(resp1)
+            auth_header = None
+
+            if digest_params:
+                auth_header = _make_digest_header(user, password, "DESCRIBE", url, digest_params)
+            else:
+                # Fall back to Basic auth
+                import base64
+                b64 = base64.b64encode(f"{user}:{password}".encode()).decode()
+                auth_header = f"Authorization: Basic {b64}\r\n"
+
+            # ── Step 3: retry with auth header ───────────────────────
+            resp2 = _rtsp_describe(s, url, cseq=2, extra_headers=auth_header)
+
+            if "RTSP/1.0 200" in resp2 or "RTSP/1.1 200" in resp2:
+                return "200 OK - stream accessible"
+            if "RTSP/1.0 401" in resp2 or "RTSP/1.1 401" in resp2:
+                return "401 Auth required"   # wrong credentials
+            if "RTSP/1.0 403" in resp2:
                 return "403 Forbidden"
-            if "RTSP/1.0 404" in data:
-                return None  # path not found, try another
+
     except OSError:
         pass
     return None
@@ -355,17 +421,55 @@ def try_http_creds(ip, port, timeout):
 
 
 def try_rtsp_creds(ip, port, timeout):
-    """Try default credentials on RTSP streams. Returns (user, pass, path, result) or None."""
+    """
+    Smart RTSP credential prober.
+
+    Returns one of:
+      ("found",   user, pw, path, result_str)  — working credentials found
+      ("open",    "",   "",  path, result_str)  — stream open, no auth needed
+      ("noauth",  ...)                          — paths exist but no creds worked
+      ("noconn",  ...)                          — could not connect at all
+      ("nopaths", ...)                          — connected but no valid paths found
+
+    Strategy:
+      Phase 1 — Path discovery with no credentials:
+        200 OK  → open stream, return immediately
+        401/403 → path exists but needs auth, queue it
+        None    → connection failed or path absent — no information
+
+      Phase 2 — Brute-force only queued (existing) paths.
+        If Phase 1 got zero responses from the server at all → report noconn.
+        If Phase 1 got responses but no valid paths → report nopaths.
+    """
+    valid_paths = []
+    got_any_response = False   # did the server respond to anything at all?
+
+    # ── Phase 1: discover which paths exist ──────────────────────────
     for path in RTSP_PATHS:
+        result = probe_rtsp_with_creds(ip, port, timeout, path, "", "")
+        if result is None:
+            continue  # connection failed or path absent — no information
+        got_any_response = True
+        if "200 OK" in result:
+            return ("open", "", "", path, result)
+        elif "401" in result or "403" in result:
+            valid_paths.append(path)
+        # other response codes (e.g. 500) — path exists but broken, skip
+
+    if not got_any_response:
+        return ("noconn", "", "", "", "")
+
+    if not valid_paths:
+        return ("nopaths", "", "", "", "")
+
+    # ── Phase 2: brute-force credentials on confirmed-existing paths ──
+    for path in valid_paths:
         for user, pw in DEFAULT_CREDS:
             result = probe_rtsp_with_creds(ip, port, timeout, path, user, pw)
             if result and "200 OK" in result:
-                return (user, pw, path, result)
-        # Also try without creds first
-        result = probe_rtsp_with_creds(ip, port, timeout, path, "", "")
-        if result and "200 OK" in result:
-            return ("", "", path, result)
-    return None
+                return ("found", user, pw, path, result)
+
+    return ("noauth", "", "", valid_paths[0], "")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -558,9 +662,12 @@ def main():
     if not args.skip_creds:
         top_candidates = [c for c in candidates if c["score"] >= 20][:args.top]
         if top_candidates:
-            print(f"[*] Probing credentials on {len(top_candidates)} candidate(s)...\n")
+            print(f"[*] Probing credentials on {len(top_candidates)} candidate(s)...")
+            print(f"    (Phase 1: discover valid RTSP paths → Phase 2: brute-force creds)\n")
             for r in top_candidates:
                 ip = r["ip"]
+                print(f"    → {ip} ...", end="", flush=True)
+
                 # HTTP creds
                 for port in [80, 8080, 8081]:
                     if port in r["open_ports"]:
@@ -568,7 +675,8 @@ def main():
                         if cred:
                             r["creds_http"] = cred
                             break
-                # RTSP creds
+
+                # RTSP creds — find the right port
                 rtsp_port = r.get("rtsp_port")
                 if not rtsp_port:
                     for p in [554, 8554]:
@@ -577,8 +685,37 @@ def main():
                             break
                 if rtsp_port:
                     cred = try_rtsp_creds(ip, rtsp_port, args.timeout + 0.5)
-                    if cred:
-                        r["creds_rtsp"] = cred
+                    r["rtsp_port"] = rtsp_port
+                    status = cred[0] if cred else "noconn"
+                    if status == "found":
+                        r["creds_rtsp"] = cred   # ("found", user, pw, path, res)
+                    elif status == "open":
+                        r["creds_rtsp"] = cred   # ("open", "", "", path, res)
+                    r["rtsp_probe_status"] = status
+                else:
+                    r["rtsp_probe_status"] = "noport"
+
+                # Print outcome
+                status = r.get("rtsp_probe_status", "noport")
+                if r.get("creds_rtsp"):
+                    kind = r["creds_rtsp"][0]
+                    if kind == "found":
+                        _, u, pw, path, _ = r["creds_rtsp"]
+                        print(f" ✅ RTSP stream: {u}/{pw} on {path}")
+                    else:
+                        _, _, _, path, _ = r["creds_rtsp"]
+                        print(f" ✅ RTSP open (no auth): {path}")
+                elif r.get("creds_http"):
+                    u, pw, _ = r["creds_http"]
+                    print(f" ✅ HTTP: {u}/{pw}")
+                elif status == "noconn":
+                    print(f" ⚠️  could not connect to RTSP port {rtsp_port}")
+                elif status == "nopaths":
+                    print(f" ⚠️  RTSP connected but no known paths found (non-standard stream path?)")
+                elif status == "noauth":
+                    print(f" ❌ RTSP paths found but no default credentials worked")
+                else:
+                    print(f" ℹ️  no RTSP port open to probe")
 
     # ── Print results ──────────────────────────────────────────────
     print("=" * 65)
@@ -617,21 +754,50 @@ def main():
     print("=" * 65)
     for r in cameras:
         ip = r["ip"]
-        print(f"\n  {ip}:")
+        # Determine best RTSP port
+        rtsp_port = r.get("rtsp_port")
+        if not rtsp_port:
+            for p in [554, 8554]:
+                if p in r["open_ports"]:
+                    rtsp_port = p
+                    break
+
+        print(f"\n  ── {ip} " + "─" * (45 - len(ip)))
+
         for port in [80, 8080, 8081]:
             if port in r["open_ports"]:
                 print(f"    Browser  →  http://{ip}:{port}/")
-        for port in [554, 8554]:
-            if port in r["open_ports"]:
-                print(f"    VLC/RTSP →  rtsp://{ip}:{port}/")
-                print(f"    (also try: rtsp://{ip}:{port}/stream  /live  /video1  /ch0_0.264)")
+
         if r.get("creds_rtsp"):
-            u, p, path, _ = r["creds_rtsp"]
-            cred_str = f"{u}:{p}@" if u else ""
-            print(f"    ✅ Working RTSP stream: rtsp://{cred_str}{ip}:{r.get('rtsp_port', 554)}{path}")
+            kind = r["creds_rtsp"][0]
+            if kind == "found":
+                _, u, pw, path, _ = r["creds_rtsp"]
+                cred_str = f"{u}:{pw}@"
+            else:  # open
+                _, _, _, path, _ = r["creds_rtsp"]
+                cred_str = ""
+            full_url = f"rtsp://{cred_str}{ip}:{rtsp_port}{path}"
+            print(f"    ✅ CONFIRMED STREAM  →  {full_url}")
+            print(f"       VLC  : vlc \"{full_url}\"")
+            print(f"       ffmpeg: ffmpeg -rtsp_transport tcp -i \"{full_url}\" ...")
+        elif rtsp_port:
+            status = r.get("rtsp_probe_status", "")
+            if status == "noconn":
+                print(f"    ⚠️  RTSP port {rtsp_port} open but could not connect during probe")
+                print(f"    Try: rtsp://{ip}:{rtsp_port}/Streaming/Channels/101")
+            elif status == "nopaths":
+                print(f"    ⚠️  RTSP connected but no known paths answered — try manually:")
+                print(f"    Try: rtsp://{ip}:{rtsp_port}/  or  rtsp://{ip}:{rtsp_port}/stream")
+            elif status == "noauth":
+                print(f"    ❌ RTSP stream found but default credentials failed")
+                print(f"    Try: rtsp://admin:<yourpassword>@{ip}:{rtsp_port}/Streaming/Channels/101")
+            else:
+                print(f"    RTSP →  rtsp://{ip}:{rtsp_port}/")
+
         if r.get("creds_http"):
-            u, p, url = r["creds_http"]
-            print(f"    ✅ HTTP login: {url}  user={u}  pass={p}")
+            u, pw, url = r["creds_http"]
+            print(f"    ✅ HTTP login  →  {url}  (user: '{u}'  pass: '{pw}')")
+
     print()
 
 
@@ -651,11 +817,26 @@ def _print_result(r):
     for reason in r["reasons"]:
         print(f"  │  ✔ {reason}")
     if r.get("creds_http"):
-        u, p, url = r["creds_http"]
-        print(f"  │  🔑 HTTP creds: user='{u}' pass='{p}' at {url}")
+        u, pw, url = r["creds_http"]
+        print(f"  │  🔑 HTTP: user='{u}' pass='{pw}' at {url}")
     if r.get("creds_rtsp"):
-        u, p, path, res = r["creds_rtsp"]
-        print(f"  │  🔑 RTSP creds: user='{u}' pass='{p}' path='{path}' → {res}")
+        kind = r["creds_rtsp"][0]
+        if kind == "found":
+            _, u, pw, path, _ = r["creds_rtsp"]
+            rtsp_port = r.get("rtsp_port", 554)
+            print(f"  │  🔑 RTSP: user='{u}' pass='{pw}' → rtsp://{u}:{pw}@{r['ip']}:{rtsp_port}{path}")
+        elif kind == "open":
+            _, _, _, path, _ = r["creds_rtsp"]
+            rtsp_port = r.get("rtsp_port", 554)
+            print(f"  │  🔓 RTSP open (no auth): rtsp://{r['ip']}:{rtsp_port}{path}")
+    else:
+        status = r.get("rtsp_probe_status")
+        if status == "noconn":
+            print(f"  │  ⚠️  RTSP: could not connect during credential probe")
+        elif status == "nopaths":
+            print(f"  │  ⚠️  RTSP: no known stream paths found — try manually")
+        elif status == "noauth":
+            print(f"  │  ❌ RTSP: stream exists but no default credentials worked")
     print("  └" + "─" * 55)
     print()
 
