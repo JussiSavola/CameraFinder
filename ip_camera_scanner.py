@@ -221,102 +221,207 @@ def probe_rtsp(ip, port, timeout, path="/"):
     return None
 
 
-def _rtsp_describe(sock, url, cseq, extra_headers=""):
-    """Send a single RTSP DESCRIBE request and return the raw response."""
+import hashlib, base64 as _base64
+
+
+def _rtsp_recv(sock):
+    """Read a full RTSP response (headers at minimum)."""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    return data.decode(errors="replace")
+
+
+def _rtsp_describe(ip, port, timeout, url, cseq, auth_header=""):
+    """
+    Open a FRESH TCP connection and send one RTSP DESCRIBE.
+    A new connection per request is necessary because many cameras
+    close the socket after a 401, making connection reuse unreliable.
+    """
     req = (
         f"DESCRIBE {url} RTSP/1.0\r\n"
         f"CSeq: {cseq}\r\n"
         f"User-Agent: CameraScanner/2.0\r\n"
         f"Accept: application/sdp\r\n"
-        f"{extra_headers}"
+        f"{auth_header}"
         f"\r\n"
     ).encode()
-    sock.sendall(req)
-    return sock.recv(4096).decode(errors="replace")
+    with socket.create_connection((ip, port), timeout=timeout) as s:
+        s.sendall(req)
+        return _rtsp_recv(s)
 
 
-def _parse_digest_challenge(response):
-    """Extract Digest auth parameters from a 401 WWW-Authenticate header."""
-    m = re.search(r'WWW-Authenticate:\s*Digest\s+(.+)', response, re.I)
+def _parse_www_authenticate(response):
+    """
+    Parse WWW-Authenticate header. Returns ("digest", params) or ("basic", {}) or None.
+    Handles both Digest (with optional qop) and Basic challenges.
+    """
+    m = re.search(r'WWW-Authenticate:\s*(\w+)\s*(.*)', response, re.I)
     if not m:
         return None
+    scheme = m.group(1).lower()
+    rest   = m.group(2)
     params = {}
-    for key, val in re.findall(r'(\w+)="([^"]*)"|', m.group(1)):
-        if key:
+    for key, val in re.findall(r'(\w+)="([^"]*)"', rest):
+        params[key] = val
+    # Also capture unquoted values (e.g. qop=auth without quotes)
+    for key, val in re.findall(r'(\w+)=([^",\s]+)', rest):
+        if key not in params:
             params[key] = val
-    return params
+    return (scheme, params)
 
 
-def _make_digest_header(user, password, method, uri, params):
-    """Build an Authorization: Digest header for the given challenge."""
-    import hashlib
+def _make_digest_auth(user, password, method, uri, params):
+    """
+    Build Authorization: Digest header, correctly handling qop="auth".
+    Without qop:  response = MD5(HA1:nonce:HA2)
+    With qop=auth: response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
+    """
     realm  = params.get("realm", "")
     nonce  = params.get("nonce", "")
+    qop    = params.get("qop", "").strip()
     ha1 = hashlib.md5(f"{user}:{realm}:{password}".encode()).hexdigest()
     ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
-    response_hash = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
-    return (
-        f'Authorization: Digest username="{user}", realm="{realm}", '
-        f'nonce="{nonce}", uri="{uri}", response="{response_hash}"\r\n'
-    )
+
+    if qop == "auth":
+        cnonce = "4b6f6172616e6d69"   # fixed client nonce (fine for a scanner)
+        nc     = "00000001"
+        resp_hash = hashlib.md5(
+            f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()
+        ).hexdigest()
+        return (
+            f'Authorization: Digest username="{user}", realm="{realm}", '
+            f'nonce="{nonce}", uri="{uri}", qop={qop}, nc={nc}, '
+            f'cnonce="{cnonce}", response="{resp_hash}"\r\n'
+        )
+    else:
+        resp_hash = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+        return (
+            f'Authorization: Digest username="{user}", realm="{realm}", '
+            f'nonce="{nonce}", uri="{uri}", response="{resp_hash}"\r\n'
+        )
+
+
+def _make_basic_auth(user, password):
+    b64 = _base64.b64encode(f"{user}:{password}".encode()).decode()
+    return f"Authorization: Basic {b64}\r\n"
+
+
+def _rtsp_status(resp):
+    """Extract numeric status code from RTSP response string, or None."""
+    m = re.search(r"RTSP/1\.[01]\s+(\d+)", resp)
+    return int(m.group(1)) if m else None
 
 
 def probe_rtsp_with_creds(ip, port, timeout, path, user, password):
     """
-    Try RTSP DESCRIBE with credentials, supporting both Basic and Digest auth.
+    Try RTSP DESCRIBE with credentials, supporting Digest (with/without qop) and Basic.
 
-    Protocol:
-      1. Send DESCRIBE with no auth header.
-      2. If 200  → stream is open, return "200 OK".
-      3. If 401 with Digest challenge → compute Digest response and retry.
-      4. If 401 with Basic challenge  → retry with Authorization: Basic header.
-      5. If still 401 after retry     → wrong credentials, return "401 Auth required".
-      6. If 404 / no response         → return None (path absent or unreachable).
+    Strategy: open ONE TCP connection, send the unauthenticated DESCRIBE to get
+    the 401 challenge and nonce, then immediately send the authenticated DESCRIBE
+    on the SAME connection (so the nonce is still valid).
+
+    If the camera closes the socket after the 401 (empty response on retry),
+    fall back to a fresh connection — some cameras accept a replayed nonce on
+    a new connection, others don't. Both attempts are made before giving up.
+
+    Returns:
+      "200 OK - stream accessible"  — success
+      "401 Auth required"           — path exists, credentials wrong/missing
+      "403 Forbidden"               — path exists but access denied
+      None                          — path absent, or no RTSP response at all
     """
     url = f"rtsp://{ip}:{port}{path}"
+
+    # ── Step 1: open connection, send unauthenticated DESCRIBE ───────
     try:
-        with socket.create_connection((ip, port), timeout=timeout) as s:
-            # ── Step 1: unauthenticated probe ────────────────────────
-            resp1 = _rtsp_describe(s, url, cseq=1)
+        conn = socket.create_connection((ip, port), timeout=timeout)
+    except OSError:
+        return None
 
-            if "RTSP/1.0 200" in resp1 or "RTSP/1.1 200" in resp1:
-                return "200 OK - stream accessible"
+    try:
+        resp1 = _rtsp_recv_on(conn,
+            f"DESCRIBE {url} RTSP/1.0\r\nCSeq: 1\r\n"
+            f"User-Agent: CameraScanner/2.0\r\nAccept: application/sdp\r\n\r\n"
+            .encode())
+    except OSError:
+        conn.close()
+        return None
 
-            if "RTSP/1.0 404" in resp1 or "RTSP/1.1 404" in resp1:
-                return None  # path does not exist
+    status1 = _rtsp_status(resp1)
+    if status1 == 200:
+        conn.close()
+        return "200 OK - stream accessible"
+    if status1 == 404 or status1 is None:
+        conn.close()
+        return None
+    if status1 != 401:
+        conn.close()
+        return None
 
-            if "RTSP/1.0 401" not in resp1 and "RTSP/1.1 401" not in resp1:
-                return None  # unexpected response, treat as absent
+    # Path exists and requires auth
+    if not user and not password:
+        conn.close()
+        return "401 Auth required"
 
-            # Path exists and requires auth — but if no credentials given, report 401
-            if not user and not password:
-                return "401 Auth required"
+    # ── Step 2: build auth header from the challenge in resp1 ────────
+    challenge = _parse_www_authenticate(resp1)
+    if challenge is None:
+        auth_header = _make_basic_auth(user, password)
+    elif challenge[0] == "digest":
+        auth_header = _make_digest_auth(user, password, "DESCRIBE", url, challenge[1])
+    else:
+        auth_header = _make_basic_auth(user, password)
 
-            # ── Step 2: try Digest auth first (most common on cameras) ──
-            digest_params = _parse_digest_challenge(resp1)
-            auth_header = None
+    req2 = (
+        f"DESCRIBE {url} RTSP/1.0\r\nCSeq: 2\r\n"
+        f"User-Agent: CameraScanner/2.0\r\nAccept: application/sdp\r\n"
+        f"{auth_header}\r\n"
+    ).encode()
 
-            if digest_params:
-                auth_header = _make_digest_header(user, password, "DESCRIBE", url, digest_params)
-            else:
-                # Fall back to Basic auth
-                import base64
-                b64 = base64.b64encode(f"{user}:{password}".encode()).decode()
-                auth_header = f"Authorization: Basic {b64}\r\n"
-
-            # ── Step 3: retry with auth header ───────────────────────
-            resp2 = _rtsp_describe(s, url, cseq=2, extra_headers=auth_header)
-
-            if "RTSP/1.0 200" in resp2 or "RTSP/1.1 200" in resp2:
-                return "200 OK - stream accessible"
-            if "RTSP/1.0 401" in resp2 or "RTSP/1.1 401" in resp2:
-                return "401 Auth required"   # wrong credentials
-            if "RTSP/1.0 403" in resp2:
-                return "403 Forbidden"
-
+    # ── Step 3A: send auth on the SAME connection ────────────────────
+    resp2 = None
+    try:
+        resp2 = _rtsp_recv_on(conn, req2)
     except OSError:
         pass
+    finally:
+        conn.close()
+
+    status2 = _rtsp_status(resp2) if resp2 else None
+
+    # ── Step 3B: if camera closed socket, retry on a fresh connection ─
+    # (some cameras accept the replayed nonce on a new TCP connection)
+    if status2 is None:
+        try:
+            with socket.create_connection((ip, port), timeout=timeout) as s:
+                resp2 = _rtsp_recv_on(s, req2)
+                status2 = _rtsp_status(resp2)
+        except OSError:
+            pass
+
+    if status2 == 200:
+        return "200 OK - stream accessible"
+    if status2 == 401:
+        return "401 Auth required"
+    if status2 == 403:
+        return "403 Forbidden"
     return None
+
+
+def _rtsp_recv_on(sock, request_bytes):
+    """Send request_bytes on sock and read the full RTSP response."""
+    sock.sendall(request_bytes)
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    return data.decode(errors="replace")
 
 
 def is_blocklisted(title, server):
