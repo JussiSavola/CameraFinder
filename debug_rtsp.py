@@ -128,6 +128,8 @@ def main():
     parser.add_argument("--user",     default="admin")
     parser.add_argument("--password", default="admin")
     parser.add_argument("--timeout",  type=float, default=5.0)
+    parser.add_argument("--preauth",  action="store_true",
+                        help="Send Basic auth on first request without waiting for 401 challenge")
     args = parser.parse_args()
 
     url = f"rtsp://{args.ip}:{args.port}{args.path}"
@@ -137,6 +139,33 @@ def main():
     print(f"  Pass   : {args.password}")
 
     # ── Step 1: open connection and send unauthenticated probe ──────────
+    if args.preauth:
+        print("\n  → --preauth mode: sending Basic auth on first request (no challenge)")
+        import base64 as _b64
+        b64 = _b64.b64encode(f"{args.user}:{args.password}".encode()).decode()
+        auth_header_pre = f"Authorization: Basic {b64}\r\n"
+        try:
+            conn = socket.create_connection((args.ip, args.port), timeout=args.timeout)
+            resp = send_describe(args.ip, args.port, args.timeout, url, cseq=1,
+                                 auth_header=auth_header_pre, sock=conn)
+            conn.close()
+        except OSError as e:
+            print(f"\n  ERROR: {e}")
+            return
+        print("\n" + "=" * 60)
+        print("  VERDICT (preauth)")
+        print("=" * 60)
+        if "RTSP/1.0 200" in resp or "RTSP/1.1 200" in resp:
+            print(f"  ✅ SUCCESS — Basic auth accepted on first request!")
+            print(f"     Working URL: rtsp://{args.user}:{args.password}@{args.ip}:{args.port}{args.path}")
+        elif "RTSP/1.0 401" in resp:
+            print(f"  → Camera sent 401 challenge in response to Basic auth")
+            print(f"     This camera requires Digest auth — run without --preauth")
+        else:
+            print(f"  ⚠️  Unexpected response — check output above")
+        print()
+        return
+
     try:
         conn = socket.create_connection((args.ip, args.port), timeout=args.timeout)
     except OSError as e:

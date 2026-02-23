@@ -108,24 +108,74 @@ CAMERA_SERVER_HEADERS = [
 ]
 
 # RTSP paths to try (ordered by likelihood for cheap Chinese cameras)
+# IMPORTANT: /live/ch00_0 must come BEFORE "/" because some cameras
+# rate-limit after the first response. "/" often returns 461 (firmware bug)
+# which wastes the one free connection slot before we try the real path.
 RTSP_PATHS = [
+    "/live/ch00_0",         # JOOAN, ANRAN, many cheap Chinese cameras (main stream) — FIRST
+    "/live/ch00_1",         # JOOAN substream
+    "/Streaming/Channels/101",  # Hikvision / Hikvision-clone
     "/",
-    "/stream",
-    "/live",
-    "/live/ch00_0",
+    "/live/ch00_1",         # JOOAN substream
     "/live/ch01_0",
+    "/Streaming/Channels/101",  # Hikvision / Hikvision-clone
+    "/Streaming/Channels/102",  # Hikvision substream
+    "/stream",
+    "/stream0",
+    "/stream1",
+    "/live",
+    "/live/main",
+    "/live/sub",
+    "/live0",
+    "/live1",
     "/ch0_0.264",
+    "/ch0_1.264",
     "/ch01.264",
-    "/video1",
+    "/video",
     "/video0",
-    "/cam/realmonitor?channel=1&subtype=0",   # Dahua
-    "/Streaming/Channels/101",                 # Hikvision
-    "/user=admin_password=tlJwpbo6_channel=1_stream=0.sdp",  # common no-brand
+    "/video1",
+    "/cam/realmonitor?channel=1&subtype=0",   # Dahua main
+    "/cam/realmonitor?channel=1&subtype=1",   # Dahua sub
+    "/h264/ch1/main/av_stream",               # Hikvision alt
+    "/h264/ch1/sub/av_stream",
     "/onvif/profile1/media.smp",
+    "/onvif/profile2/media.smp",
+    "/MediaInput/h264",
     "/11",
     "/12",
     "/1",
+    "/0",
 ]
+
+# ONVIF device service endpoint for credential probing
+ONVIF_DEVICE_SERVICE = "/onvif/device_service"
+ONVIF_GETDEVICEINFO = """<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+               xmlns:tds="http://www.onvif.org/ver10/device/wsdl">
+  <soap:Body>
+    <tds:GetDeviceInformation/>
+  </soap:Body>
+</soap:Envelope>"""
+
+ONVIF_GETDEVICEINFO_AUTH = """<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+               xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
+               xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+               xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+  <soap:Header>
+    <wsse:Security>
+      <wsse:UsernameToken>
+        <wsse:Username>{username}</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd#PasswordDigest">{password_digest}</wsse:Password>
+        <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd#Base64Binary">{nonce}</wsse:Nonce>
+        <wsu:Created>{created}</wsu:Created>
+      </wsse:UsernameToken>
+    </wsse:Security>
+  </soap:Header>
+  <soap:Body>
+    <tds:GetDeviceInformation/>
+  </soap:Body>
+</soap:Envelope>"""
 
 # Default credentials to try (username, password)
 DEFAULT_CREDS = [
@@ -499,15 +549,106 @@ def probe_http(ip, port, timeout):
 # ─────────────────────────────────────────────────────────────────────
 #  Credential probing
 # ─────────────────────────────────────────────────────────────────────
-def try_http_creds(ip, port, timeout):
-    """Try default credentials on HTTP. Return (user, pass, url) or None."""
+def try_onvif_creds(ip, timeout, creds=None):
+    """
+    Probe ONVIF device service with credentials.
+    Uses WS-Security PasswordDigest auth — the standard ONVIF auth method.
+    Returns (user, password, model_info) or None.
+
+    This is a valuable parallel path to RTSP probing because:
+    - Works even when RTSP stream paths are non-standard
+    - ONVIF auth is completely independent of RTSP auth
+    - All cameras that responded to WS-Discovery support this endpoint
+    """
     if not HAS_REQUESTS:
         return None
+    if creds is None:
+        creds = DEFAULT_CREDS
+
+    import base64 as _b64, hashlib as _hl, os as _os
+    from datetime import datetime, timezone
+
+    url = f"http://{ip}:{80}/onvif/device_service"
+    # Also try port 8080 if 80 fails
+    urls_to_try = [
+        f"http://{ip}:80/onvif/device_service",
+        f"http://{ip}:8080/onvif/device_service",
+    ]
+
+    def make_onvif_auth_body(user, password):
+        """Build WS-Security PasswordDigest auth envelope."""
+        raw_nonce   = _os.urandom(16)
+        nonce_b64   = _b64.b64encode(raw_nonce).decode()
+        created     = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # PasswordDigest = Base64(SHA1(nonce + created + password))
+        digest_raw  = raw_nonce + created.encode() + password.encode()
+        digest_b64  = _b64.b64encode(_hl.sha1(digest_raw).digest()).decode()
+        return ONVIF_GETDEVICEINFO_AUTH.format(
+            username=user,
+            password_digest=digest_b64,
+            nonce=nonce_b64,
+            created=created,
+        )
+
+    headers = {
+        "Content-Type": "application/soap+xml; charset=utf-8",
+        "User-Agent":   "CameraScanner/2.0",
+    }
+
+    # First check if the endpoint exists at all (unauthenticated)
+    endpoint = None
+    for url in urls_to_try:
+        try:
+            r = requests.post(url, data=ONVIF_GETDEVICEINFO,
+                              headers=headers, timeout=timeout, verify=False)
+            # 200 (open), 400 (needs auth but responded), 401/403 all mean endpoint exists
+            if r.status_code in (200, 400, 401, 403):
+                endpoint = url
+                if r.status_code == 200:
+                    # Open ONVIF — extract model info and return
+                    model = _extract_onvif_model(r.text)
+                    return ("", "", model or "open (no auth)")
+                break
+        except Exception:
+            continue
+
+    if endpoint is None:
+        return None   # ONVIF device service not reachable on this host
+
+    # Brute-force credentials
+    for user, pw in creds:
+        try:
+            body = make_onvif_auth_body(user, pw)
+            r = requests.post(endpoint, data=body, headers=headers,
+                              timeout=timeout, verify=False)
+            if r.status_code == 200 and "GetDeviceInformationResponse" in r.text:
+                model = _extract_onvif_model(r.text)
+                return (user, pw, model or "unknown model")
+        except Exception:
+            continue
+
+    return None
+
+
+def _extract_onvif_model(xml_text):
+    """Pull Manufacturer + Model from ONVIF GetDeviceInformationResponse."""
+    mfr = re.search(r"<[^>]*Manufacturer[^>]*>([^<]+)<", xml_text)
+    mdl = re.search(r"<[^>]*Model[^>]*>([^<]+)<", xml_text)
+    parts = [m.group(1).strip() for m in [mfr, mdl] if m]
+    return " / ".join(parts) if parts else None
+
+
+def try_http_creds(ip, port, timeout, creds=None):
+    """Try credentials on HTTP. Return (user, pass, url) or None."""
+    if not HAS_REQUESTS:
+        return None
+    if creds is None:
+        creds = DEFAULT_CREDS
     scheme = "https" if port in (443, 8443) else "http"
     base = f"{scheme}://{ip}:{port}"
     # Paths that camera login APIs commonly sit on
     login_paths = ["/", "/login", "/web/login", "/cgi-bin/hi3510/param.cgi"]
-    for user, pw in DEFAULT_CREDS:
+    for user, pw in creds:
         for path in login_paths:
             url = base + path
             try:
@@ -525,7 +666,7 @@ def try_http_creds(ip, port, timeout):
     return None
 
 
-def try_rtsp_creds(ip, port, timeout):
+def try_rtsp_creds(ip, port, timeout, creds=None):
     """
     Smart RTSP credential prober.
 
@@ -536,45 +677,247 @@ def try_rtsp_creds(ip, port, timeout):
       ("noconn",  ...)                          — could not connect at all
       ("nopaths", ...)                          — connected but no valid paths found
 
-    Strategy:
-      Phase 1 — Path discovery with no credentials:
-        200 OK  → open stream, return immediately
-        401/403 → path exists but needs auth, queue it
-        None    → connection failed or path absent — no information
+    Phase 1 — path discovery on a SINGLE persistent TCP connection.
+      All DESCRIBE requests are pipelined through one socket so rate-limiting
+      cameras only see one connection, not one-per-path.
+      Collects: open paths (200), auth-required paths (401/403).
 
-      Phase 2 — Brute-force only queued (existing) paths.
-        If Phase 1 got zero responses from the server at all → report noconn.
-        If Phase 1 got responses but no valid paths → report nopaths.
+    Phase 2 — credential brute-force, one connection per candidate credential.
+      Only runs against the confirmed-existing paths from Phase 1.
+      Uses the same-connection nonce trick (CSeq 1 = challenge, CSeq 2 = auth).
     """
-    valid_paths = []
-    got_any_response = False   # did the server respond to anything at all?
+    if creds is None:
+        creds = DEFAULT_CREDS
 
-    # ── Phase 1: discover which paths exist ──────────────────────────
+    valid_paths  = []   # paths that returned 401/403
+    got_any      = False
+    saved_challenge = None   # reuse the first challenge for Phase 2
+
+    # ── Phase 1: probe all paths, reconnecting if camera closes connection ──
+    # Some cameras close the TCP connection after every response (even 401).
+    # We detect this (empty/error response) and transparently reconnect so we
+    # probe every path — not just the first one before the camera closes.
+    conn = None
+    cseq = 0
+
     for path in RTSP_PATHS:
-        result = probe_rtsp_with_creds(ip, port, timeout, path, "", "")
-        if result is None:
-            continue  # connection failed or path absent — no information
-        got_any_response = True
-        if "200 OK" in result:
-            return ("open", "", "", path, result)
-        elif "401" in result or "403" in result:
-            valid_paths.append(path)
-        # other response codes (e.g. 500) — path exists but broken, skip
+        cseq += 1
+        url = f"rtsp://{ip}:{port}{path}"
+        req = (
+            f"DESCRIBE {url} RTSP/1.0\r\nCSeq: {cseq}\r\n"
+            f"User-Agent: CameraScanner/2.0\r\nAccept: application/sdp\r\n\r\n"
+        ).encode()
 
-    if not got_any_response:
+        # Try each path up to 2 times: once on the existing connection,
+        # and if the camera closed it, reconnect and retry THE SAME PATH.
+        # Without this, a camera that closes after every response would cause
+        # every odd-numbered path to be silently skipped.
+        for attempt in range(2):
+            if conn is None:
+                try:
+                    conn = socket.create_connection((ip, port), timeout=timeout)
+                except OSError:
+                    break   # truly unreachable — stop all probing
+
+            resp = None
+            try:
+                resp = _rtsp_recv_on(conn, req)
+            except OSError:
+                try: conn.close()
+                except Exception: pass
+                conn = None
+
+            if not resp:
+                # Camera closed connection after previous response.
+                # Discard socket and retry THIS SAME PATH on a new connection.
+                try: conn.close()
+                except Exception: pass
+                conn = None
+                continue   # attempt 2: reconnect and retry same path
+
+            # Got a real response — process and move to next path
+            got_any = True
+            status = _rtsp_status(resp)
+            if status == 200:
+                try: conn.close()
+                except Exception: pass
+                return ("open", "", "", path, "200 OK - stream accessible")
+            elif status in (401, 403):
+                valid_paths.append(path)
+                if saved_challenge is None:
+                    saved_challenge = _parse_www_authenticate(resp)
+            # other status (404 etc. or 461) — path absent on this camera
+            # Small delay after each response to avoid rate-limiting on
+            # cameras that allow only one connection per N milliseconds
+            time.sleep(0.1)
+            break   # done with this path regardless of status
+
+    if conn is not None:
+        try: conn.close()
+        except Exception: pass
+
+
+
+    if not got_any:
         return ("noconn", "", "", "", "")
-
     if not valid_paths:
         return ("nopaths", "", "", "", "")
 
-    # ── Phase 2: brute-force credentials on confirmed-existing paths ──
-    for path in valid_paths:
-        for user, pw in DEFAULT_CREDS:
-            result = probe_rtsp_with_creds(ip, port, timeout, path, user, pw)
-            if result and "200 OK" in result:
-                return ("found", user, pw, path, result)
+    # Brief pause between Phase 1 and Phase 2 to let the camera's
+    # rate limiter reset before we start credential attempts
+    time.sleep(0.5)
 
-    return ("noauth", "", "", valid_paths[0], "")
+    # ── Phase 2: brute-force credentials on confirmed paths ──────────
+    #
+    # We handle three firmware behaviours seen in the wild:
+    #
+    # Type A — Standard Digest (e.g. .194):
+    #   Unauthenticated DESCRIBE → 401 + nonce → auth on same connection → 200
+    #
+    # Type B — One-response-per-connection Digest (e.g. .148):
+    #   Unauthenticated DESCRIBE → 401 → camera closes socket
+    #   Must open a 2nd connection, get fresh 401+nonce, send auth → 200
+    #
+    # Type C — Silent unless credentials sent upfront (e.g. .234, .252):
+    #   Unauthenticated DESCRIBE → silence (camera ignores it)
+    #   Must send DESCRIBE with Basic auth on first request → 200 or 401
+    #
+    # Strategy per credential attempt:
+    #   Step 1: try unauthenticated → if 401, do Type A then Type B
+    #   Step 2: if silence, try Basic auth upfront (Type C)
+
+    paths_to_try = valid_paths if valid_paths else RTSP_PATHS
+
+    for path in paths_to_try:
+        url = f"rtsp://{ip}:{port}{path}"
+        for user, pw in creds:
+            try:
+                # ── Step 1: unauthenticated probe (Type A / B detection) ──
+                connA = socket.create_connection((ip, port), timeout=timeout)
+                req_unauth = (
+                    f"DESCRIBE {url} RTSP/1.0\r\nCSeq: 1\r\n"
+                    f"User-Agent: CameraScanner/2.0\r\nAccept: application/sdp\r\n\r\n"
+                ).encode()
+                try:
+                    resp_unauth = _rtsp_recv_on(connA, req_unauth)
+                except OSError:
+                    resp_unauth = None
+
+                status_unauth = _rtsp_status(resp_unauth) if resp_unauth else None
+
+                if status_unauth == 200:
+                    try: connA.close()
+                    except Exception: pass
+                    return ("open", "", "", path, "200 OK - stream accessible")
+
+                if status_unauth == 401:
+                    # Type A: try auth on same connection first
+                    challenge = _parse_www_authenticate(resp_unauth)
+                    if challenge and challenge[0] == "digest":
+                        auth_hdr = _make_digest_auth(user, pw, "DESCRIBE", url, challenge[1])
+                    else:
+                        auth_hdr = _make_basic_auth(user, pw)
+
+                    req_auth = (
+                        f"DESCRIBE {url} RTSP/1.0\r\nCSeq: 2\r\n"
+                        f"User-Agent: CameraScanner/2.0\r\nAccept: application/sdp\r\n"
+                        f"{auth_hdr}\r\n"
+                    ).encode()
+                    try:
+                        resp_auth = _rtsp_recv_on(connA, req_auth)
+                        if _rtsp_status(resp_auth) == 200:
+                            try: connA.close()
+                            except Exception: pass
+                            return ("found", user, pw, path, "200 OK - stream accessible")
+                    except OSError:
+                        pass   # camera closed — fall through to Type B
+
+                    # Type B: open fresh connection, get new nonce, send auth
+                    try: connA.close()
+                    except Exception: pass
+
+                    try:
+                        connB = socket.create_connection((ip, port), timeout=timeout)
+                        try:
+                            resp_b1 = _rtsp_recv_on(connB, req_unauth)
+                            if resp_b1 and _rtsp_status(resp_b1) == 401:
+                                challenge_b = _parse_www_authenticate(resp_b1)
+                                if challenge_b and challenge_b[0] == "digest":
+                                    auth_hdr_b = _make_digest_auth(user, pw, "DESCRIBE", url, challenge_b[1])
+                                else:
+                                    auth_hdr_b = _make_basic_auth(user, pw)
+                                req_b2 = (
+                                    f"DESCRIBE {url} RTSP/1.0\r\nCSeq: 2\r\n"
+                                    f"User-Agent: CameraScanner/2.0\r\nAccept: application/sdp\r\n"
+                                    f"{auth_hdr_b}\r\n"
+                                ).encode()
+                                resp_b2 = _rtsp_recv_on(connB, req_b2)
+                                if _rtsp_status(resp_b2) == 200:
+                                    try: connB.close()
+                                    except Exception: pass
+                                    return ("found", user, pw, path, "200 OK - stream accessible")
+                        except OSError:
+                            pass
+                        finally:
+                            try: connB.close()
+                            except Exception: pass
+                    except OSError:
+                        pass
+
+                else:
+                    # Type C: silence — camera ignores unauthenticated requests.
+                    # Send Basic auth upfront on the same connection.
+                    try: connA.close()
+                    except Exception: pass
+
+                    auth_hdr = _make_basic_auth(user, pw)
+                    try:
+                        connC = socket.create_connection((ip, port), timeout=timeout)
+                        req_basic = (
+                            f"DESCRIBE {url} RTSP/1.0\r\nCSeq: 1\r\n"
+                            f"User-Agent: CameraScanner/2.0\r\nAccept: application/sdp\r\n"
+                            f"{auth_hdr}\r\n"
+                        ).encode()
+                        try:
+                            resp_c = _rtsp_recv_on(connC, req_basic)
+                            status_c = _rtsp_status(resp_c) if resp_c else None
+                            if status_c == 200:
+                                try: connC.close()
+                                except Exception: pass
+                                return ("found", user, pw, path, "200 OK - stream accessible")
+                            elif status_c == 401:
+                                # Camera wants Digest — get nonce and retry on same conn
+                                challenge_c = _parse_www_authenticate(resp_c)
+                                if challenge_c and challenge_c[0] == "digest":
+                                    auth_hdr_d = _make_digest_auth(user, pw, "DESCRIBE", url, challenge_c[1])
+                                    req_d = (
+                                        f"DESCRIBE {url} RTSP/1.0\r\nCSeq: 2\r\n"
+                                        f"User-Agent: CameraScanner/2.0\r\nAccept: application/sdp\r\n"
+                                        f"{auth_hdr_d}\r\n"
+                                    ).encode()
+                                    resp_d = _rtsp_recv_on(connC, req_d)
+                                    if _rtsp_status(resp_d) == 200:
+                                        try: connC.close()
+                                        except Exception: pass
+                                        return ("found", user, pw, path, "200 OK - stream accessible")
+                        except OSError:
+                            pass
+                        finally:
+                            try: connC.close()
+                            except Exception: pass
+                    except OSError:
+                        pass
+
+            except OSError:
+                pass
+
+            time.sleep(0.3)
+
+    return ("noauth", "", "", paths_to_try[0] if paths_to_try else "/", "")
+
+
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -619,7 +962,7 @@ def scan_host(ip, timeout):
             "ip": ip, "open_ports": open_ports, "score": -999,
             "blocked": True, "block_reason": block_reason,
             "reasons": [], "rtsp": None, "http": [],
-            "creds_http": None, "creds_rtsp": None,
+            "creds_http": None, "creds_rtsp": None, "creds_onvif": None,
         }
 
     # 3. RTSP probing — try multiple paths
@@ -670,6 +1013,8 @@ def scan_host(ip, timeout):
         "block_reason": "",
         "creds_http": None,
         "creds_rtsp": None,
+        "creds_onvif": None,
+        "creds_onvif": None,
     }
 
 
@@ -710,16 +1055,64 @@ def main():
     parser.add_argument("--skip-onvif",  action="store_true")
     parser.add_argument("--skip-creds",  action="store_true")
     parser.add_argument("--top",         type=int,   default=20,
-                        help="Only probe creds on top N candidates")
+                        help="Only probe creds on top N candidates (default: 20)")
+    parser.add_argument("--wordlist",    default=None,
+                        help="Path to a wordlist file. "
+                             "Each line: 'password' or 'user:password'. "
+                             "These are tried IN ADDITION TO the built-in defaults.")
+    parser.add_argument("--wordlist-only", action="store_true",
+                        help="Use ONLY the wordlist, skip built-in default credentials")
+    parser.add_argument("--user",        default=None,
+                        help="Fix the username for wordlist entries that have no 'user:' prefix "
+                             "(default: try all built-in usernames)")
     args = parser.parse_args()
 
     network = args.network.rstrip(".")
     hosts = [f"{network}.{i}" for i in range(1, 255)]
 
+    # ── Build effective credential list ──────────────────────────────
+    extra_creds = []
+    if args.wordlist:
+        try:
+            with open(args.wordlist, "r", encoding="utf-8", errors="replace") as wf:
+                for line in wf:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if ":" in line:
+                        u, p = line.split(":", 1)
+                        extra_creds.append((u.strip(), p.strip()))
+                    else:
+                        # No username given — use --user if specified, else try common usernames
+                        if args.user:
+                            extra_creds.append((args.user, line))
+                        else:
+                            for u in ("admin", "root", "user", "guest"):
+                                extra_creds.append((u, line))
+            print(f"[+] Loaded {len(extra_creds)} credential(s) from wordlist: {args.wordlist}")
+        except FileNotFoundError:
+            print(f"[!] Wordlist file not found: {args.wordlist}")
+            return
+        except Exception as e:
+            print(f"[!] Error reading wordlist: {e}")
+            return
+
+    if args.wordlist_only:
+        effective_creds = extra_creds
+        creds_source = f"wordlist only ({len(effective_creds)} entries)"
+    elif extra_creds:
+        # Wordlist entries go FIRST so user-supplied guesses are tried before defaults
+        effective_creds = extra_creds + [c for c in DEFAULT_CREDS if c not in extra_creds]
+        creds_source = f"wordlist ({len(extra_creds)}) + built-in defaults ({len(DEFAULT_CREDS)})"
+    else:
+        effective_creds = DEFAULT_CREDS
+        creds_source = f"built-in defaults ({len(DEFAULT_CREDS)} entries)"
+
     print("=" * 65)
     print("  IP Camera Scanner v2")
     print("=" * 65)
     print(f"  Network : {network}.0/24  |  Timeout: {args.timeout}s  |  Workers: {args.workers}")
+    print(f"  Credentials : {creds_source}")
     print(f"  Blocklist active for: unifi, shelly, synology, routers, NAS ...")
     print("=" * 65)
 
@@ -773,10 +1166,13 @@ def main():
                 ip = r["ip"]
                 print(f"    → {ip} ...", end="", flush=True)
 
+                # Brief pause before probing each camera to let rate limiters reset
+                time.sleep(2.0)
+
                 # HTTP creds
                 for port in [80, 8080, 8081]:
                     if port in r["open_ports"]:
-                        cred = try_http_creds(ip, port, args.timeout + 0.5)
+                        cred = try_http_creds(ip, port, args.timeout + 0.5, effective_creds)
                         if cred:
                             r["creds_http"] = cred
                             break
@@ -789,7 +1185,7 @@ def main():
                             rtsp_port = p
                             break
                 if rtsp_port:
-                    cred = try_rtsp_creds(ip, rtsp_port, args.timeout + 0.5)
+                    cred = try_rtsp_creds(ip, rtsp_port, args.timeout + 0.5, effective_creds)
                     r["rtsp_port"] = rtsp_port
                     status = cred[0] if cred else "noconn"
                     if status == "found":
@@ -799,6 +1195,12 @@ def main():
                     r["rtsp_probe_status"] = status
                 else:
                     r["rtsp_probe_status"] = "noport"
+
+                # ONVIF creds — try for all ONVIF-responding cameras
+                if ip in onvif_ips and not r.get("creds_rtsp"):
+                    cred = try_onvif_creds(ip, args.timeout + 0.5, effective_creds)
+                    if cred:
+                        r["creds_onvif"] = cred
 
                 # Print outcome
                 status = r.get("rtsp_probe_status", "noport")
@@ -810,13 +1212,19 @@ def main():
                     else:
                         _, _, _, path, _ = r["creds_rtsp"]
                         print(f" ✅ RTSP open (no auth): {path}")
+                elif r.get("creds_onvif"):
+                    u, pw, model = r["creds_onvif"]
+                    if u:
+                        print(f" ✅ ONVIF: {u}/{pw} ({model})")
+                    else:
+                        print(f" ✅ ONVIF open (no auth): {model}")
                 elif r.get("creds_http"):
                     u, pw, _ = r["creds_http"]
                     print(f" ✅ HTTP: {u}/{pw}")
                 elif status == "noconn":
                     print(f" ⚠️  could not connect to RTSP port {rtsp_port}")
                 elif status == "nopaths":
-                    print(f" ⚠️  RTSP connected but no known paths found (non-standard stream path?)")
+                    print(f" ⚠️  RTSP: non-standard paths — but check ONVIF result above")
                 elif status == "noauth":
                     print(f" ❌ RTSP paths found but no default credentials worked")
                 else:
@@ -899,6 +1307,11 @@ def main():
             else:
                 print(f"    RTSP →  rtsp://{ip}:{rtsp_port}/")
 
+        if r.get("creds_onvif"):
+            u, pw, model = r["creds_onvif"]
+            if u:
+                print(f"    ✅ ONVIF confirmed  →  user: '{u}'  pass: '{pw}'  ({model})")
+                print(f"       These credentials should also work for RTSP streams on this camera")
         if r.get("creds_http"):
             u, pw, url = r["creds_http"]
             print(f"    ✅ HTTP login  →  {url}  (user: '{u}'  pass: '{pw}')")
@@ -921,6 +1334,12 @@ def _print_result(r):
             print(f"  │  Server  : {h['server']}")
     for reason in r["reasons"]:
         print(f"  │  ✔ {reason}")
+    if r.get("creds_onvif"):
+        u, pw, model = r["creds_onvif"]
+        if u:
+            print(f"  │  🔑 ONVIF: user='{u}' pass='{pw}' — {model}")
+        else:
+            print(f"  │  🔓 ONVIF open (no auth) — {model}")
     if r.get("creds_http"):
         u, pw, url = r["creds_http"]
         print(f"  │  🔑 HTTP: user='{u}' pass='{pw}' at {url}")
