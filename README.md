@@ -4,6 +4,8 @@ A Python tool for discovering and identifying IP cameras on your local network. 
 
 Built through real-world testing against a heterogeneous collection of cheap Chinese cameras (JOOAN, ANRAN, Hikvision-clone, and others), so it handles the firmware quirks that most scanners don't.
 
+All the bugs and other issues in the code are created and implemented by Claude Sonnet 4.6 so all the complaints should be directed there. 
+
 ---
 
 ## Features
